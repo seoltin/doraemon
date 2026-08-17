@@ -14,3 +14,9 @@ ENV/
 .vscode/
 *.swp
 *.swo
+
+# SQLite database files
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3

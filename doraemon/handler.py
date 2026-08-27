@@ -15,8 +15,11 @@ from typing import Optional
 from sqlalchemy.ext.asyncio import AsyncSession
 from .session_manager import session_manager
 from .router import agent_router
-from .executor import ExecutorResult
+from .executor import ExecutorResult, BaseExecutor
 from .feishu_client import feishu_client
+from .config import settings
+from .worker_registry import worker_registry
+from .remote_executor import RemoteExecutor
 
 
 class FeishuHandler:
@@ -270,19 +273,69 @@ class FeishuHandler:
         history = await session_manager.get_history(db, session.id, limit=10)
         print(f"[Chat] History rounds: {len(history)}")
 
-        # 4. 选择执行器 (粘性路由: Session 绑定哪个 Agent 就用哪个)
-        executor = agent_router.pick(
-            session_agent=session.agent_name
-        )
-        print(f"[Chat] Using executor: {executor.name}")
+        # 4. 选择执行器 (粘性路由 + 故障重试)
+        executor: BaseExecutor
+        max_retries = 3
+        tried_workers: set[str] = set()
+        result: Optional[ExecutorResult] = None
 
-        # 5. 执行 (把历史上下文传给 Agent)
-        result: ExecutorResult = await executor.execute(
-            session_id=session.id,
-            prompt=text,
-            context={"chat_id": chat_id, "sender_id": sender_id},
-            history=history
-        )
+        if settings.worker_mode == "local":
+            executor = agent_router.pick(session_agent=session.agent_name)
+            print(f"[Chat] Using local executor: {executor.name}")
+            result = await executor.execute(
+                session_id=session.id,
+                prompt=text,
+                context={"chat_id": chat_id, "chat_type": chat_type, "sender_id": sender_id, "agent": session.agent_name},
+                history=history
+            )
+        else:
+            # 分布式模式: 选 Worker → 执行 → 失败且可重试 → 换 Worker 重试
+            for attempt in range(1, max_retries + 1):
+                executor = await self._pick_remote_executor(
+                    db, session.id, session.agent_name, exclude_workers=tried_workers
+                )
+                if executor is None:
+                    break
+
+                tried_workers.add(executor.worker_id)
+                print(f"[Chat] Attempt {attempt}/{max_retries} -> Worker: {executor.worker_id} @ {executor.endpoint}")
+
+                result = await executor.execute(
+                    session_id=session.id,
+                    prompt=text,
+                    context={
+                        "chat_id": chat_id,
+                        "chat_type": chat_type,
+                        "sender_id": sender_id,
+                        "agent": session.agent_name,
+                        "message_id": message_id
+                    },
+                    history=history
+                )
+
+                if result.is_success:
+                    break
+                if not result.retryable:
+                    print(f"[Chat] Non-retryable error: {result.error}")
+                    break
+
+                # 可重试错误: 清除绑定, 下次选别的 Worker
+                print(f"[Chat] Attempt {attempt} failed (retryable): {result.error}")
+                await worker_registry.clear_session_binding(db, session.id)
+                result = None
+
+        if result is None:
+            reply_text = (
+                f"❌ 没有可用的 Worker\n"
+                f"已尝试 {len(tried_workers)} 个 Worker, 均不可用。\n"
+                f"请稍后重试或联系管理员。"
+            )
+            await feishu_client.reply_text(message_id, reply_text)
+            await session_manager.update_message_result(
+                db, message_id=message_id,
+                status="error", error_message="no_worker_available"
+            )
+            return {"code": 0}
 
         # 6. 回复飞书
         reply_text = result.output_text
@@ -318,6 +371,50 @@ class FeishuHandler:
         await db.commit()
 
         return {"code": 0}
+
+    async def _pick_remote_executor(
+        self,
+        db: AsyncSession,
+        session_id: str,
+        agent_name: str,
+        exclude_workers: set[str] = None
+    ) -> Optional[RemoteExecutor]:
+        """分布式模式: 挑选一个健康的 Worker, 返回 RemoteExecutor
+        :param exclude_workers: 排除的 Worker ID 集合 (重试时跳过已失败的 Worker)
+        """
+        exclude_workers = exclude_workers or set()
+
+        # 1. 先查这个 Session 有没有绑定过 Worker
+        binding = await worker_registry.get_session_binding(db, session_id)
+
+        if binding and binding.worker_id not in exclude_workers:
+            # 有绑定, 且不在排除列表中, 检查这个 Worker 还健康吗
+            worker = await worker_registry.get_worker(db, binding.worker_id)
+            if worker and worker.status == "running":
+                # 复用之前绑定的 Worker (粘性路由)
+                print(f"[Router] Reusing bound worker: {worker.id}")
+                return RemoteExecutor(worker.id, worker.endpoint)
+            else:
+                # Worker 挂了, 清除旧绑定
+                print(f"[Router] Bound worker {binding.worker_id} is gone, re-selecting...")
+                await worker_registry.clear_session_binding(db, session_id)
+
+        # 2. 挑一个新的健康 Worker: 支持这个 Agent, 不在排除列表中, 当前活跃任务最少
+        healthy_workers = await worker_registry.get_healthy_workers(db, agent_name=agent_name)
+        candidates = [w for w in healthy_workers if w.id not in exclude_workers]
+        if not candidates:
+            print(f"[Router] No healthy workers available for agent: {agent_name} (tried: {exclude_workers})")
+            return None
+
+        # 选 active_turns 最少的 Worker (最少负载)
+        selected = min(candidates, key=lambda w: w.active_turns or 0)
+        print(f"[Router] Selected worker: {selected.id} @ {selected.endpoint} (active_turns={selected.active_turns})")
+
+        # 3. 绑定 Session 到这个 Worker
+        await worker_registry.bind_session(db, session_id, selected.id, selected.endpoint)
+
+        # 4. 返回 RemoteExecutor
+        return RemoteExecutor(selected.id, selected.endpoint)
 
     def _is_duplicate(self, message_id: str) -> bool:
         """检查消息是否重复"""

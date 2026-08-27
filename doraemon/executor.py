@@ -22,6 +22,7 @@ class ExecutorResult(BaseModel):
     output_text: str = ""
     session_token: Optional[str] = None
     error: Optional[str] = None
+    retryable: bool = False
 
     @property
     def is_success(self) -> bool:

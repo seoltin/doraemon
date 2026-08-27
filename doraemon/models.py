@@ -1,4 +1,4 @@
-from sqlalchemy import Column, String, Text, DateTime, Boolean, Index
+from sqlalchemy import Column, String, Text, DateTime, Boolean, Integer, Index
 from sqlalchemy.sql import func
 from .db import Base
 
@@ -9,6 +9,9 @@ class SessionRecord(Base):
     chat_id = Column(String(128), nullable=False, index=True, comment="飞书 chat_id or user open_id")
     chat_type = Column(String(16), nullable=False, default="p2p", comment="p2p/group/thread")
     agent_name = Column(String(32), nullable=False, default="echo", comment="绑定的 Agent 名称")
+    # V0.3 新增: Worker 粘性绑定
+    worker_id = Column(String(64), nullable=True, index=True, comment="绑定的 WorkerID")
+    worker_endpoint = Column(String(256), nullable=True, comment="绑定的 Worker 地址")
     reset_count = Column(Boolean, default=False, comment="是否已重置")
     is_active = Column(Boolean, default=True, comment="是否活跃")
     last_message_text = Column(Text, nullable=True, comment="最后一条消息内容(摘要)")
@@ -38,3 +41,34 @@ class MessageRecord(Base):
         Index("ix_messages_session", "session_id", "created_at"),
         Index("ix_messages_sender", "sender_id", "created_at"),
     )
+
+
+class WorkerRecord(Base):
+    """V0.3 新增: Worker 注册表"""
+    __tablename__ = "workers"
+
+    id = Column(String(64), primary_key=True, comment="WorkerID")
+    endpoint = Column(String(256), nullable=False, comment="Worker HTTP 地址, e.g. http://127.0.0.1:9001")
+    status = Column(String(16), nullable=False, default="registering", comment="registering/running/draining/unhealthy/offline")
+    version = Column(String(32), default="0.3.0", comment="Worker 版本")
+    agents = Column(Text, nullable=True, comment="支持的 Agent 列表, JSON 数组")
+    active_turns = Column(Integer, default=0, comment="当前活跃任务数")
+    active_sessions = Column(Integer, default=0, comment="当前活跃会话数")
+    last_error = Column(Text, nullable=True, comment="最后错误信息")
+    last_heartbeat_at = Column(DateTime, nullable=True, comment="最后心跳时间")
+    registered_at = Column(DateTime, server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    __table_args__ = (
+        Index("ix_workers_status", "status"),
+    )
+
+class WorkerSessionBinding(Base):
+    """V0.3 新增: Session-Worker 绑定关系 (用于粘性路由)"""
+    __tablename__ = "worker_session_bindings"
+
+    session_id = Column(String(128), primary_key=True, comment="SessionID")
+    worker_id = Column(String(64), nullable=False, index=True, comment="WorkerID")
+    worker_endpoint = Column(String(256), nullable=False, comment="Worker 地址")
+    bound_at = Column(DateTime, server_default=func.now(), nullable=False)
+    last_used_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
